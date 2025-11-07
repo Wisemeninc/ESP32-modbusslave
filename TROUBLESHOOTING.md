@@ -20,7 +20,7 @@ If you DON'T see this message every 10 seconds:
 #### HW-519 Wiring (CRITICAL):
 ```
 ESP32-S3          HW-519
-GPIO17 (TX) -->   TXD
+GPIO18 (TX) -->   TXD
 GPIO16 (RX) <--   RXD
 5V          -->   VCC (NOT 3.3V!)
 GND         -->   GND
@@ -56,7 +56,7 @@ The HW-519 has some configuration jumpers/options:
 
 ### 4. Test UART Communication
 
-Create a simple loopback test by temporarily connecting GPIO17 to GPIO16 (short TX to RX on ESP32 side):
+Create a simple loopback test by temporarily connecting GPIO18 to GPIO16 (short TX to RX on ESP32 side):
 
 **WARNING:** Do this ONLY with HW-519 disconnected!
 
@@ -179,12 +179,12 @@ HW-519 needs:
 
 Use a multimeter to verify:
 - VCC = ~5V
-- GPIO17/16 when idle = ~3.3V
+- GPIO18/16 when idle = ~3.3V
 
 ### 14. Last Resort: Oscilloscope/Logic Analyzer
 
 If you have test equipment:
-- Monitor GPIO17 (TX) - should see data bursts when master polls
+- Monitor GPIO18 (TX) - should see data bursts when master polls
 - Monitor A/B differential voltage - should see ±2V to ±6V swings
 - Verify baud rate is actually 9600 (104 μs per bit)
 
@@ -201,7 +201,7 @@ Provide these details:
 
 - [ ] ESP32 boots and shows "Modbus slave alive" every 10 seconds
 - [ ] HW-519 has 5V power (NOT 3.3V)
-- [ ] GPIO17 → HW-519 TXD
+- [ ] GPIO18 → HW-519 TXD
 - [ ] GPIO16 → HW-519 RXD  
 - [ ] Common ground connected
 - [ ] A/B connected to bus (tried both polarities)

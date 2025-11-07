@@ -10,7 +10,7 @@ This project implements a Modbus RTU slave on an ESP32-S3 using the HW-519 RS485
   - Register 1: Random number (updated every 5 seconds)
   - Register 2: Second counter (increments every second, auto-resets at 65535)
   - Registers 3-9: General purpose holding registers
-- **MAX485 transceiver** for RS485 communication
+- **HW-519 RS485 module** with automatic flow control
 - **Half-duplex RS485** communication
 - **WiFi Access Point** for configuration (active for 2 minutes after boot)
   - SSID: `ESP32-Modbus-Config`
@@ -32,8 +32,8 @@ The HW-519 module has **automatic flow control** and only requires TX and RX con
 
 | Function | GPIO Pin | HW-519 Pin | Notes                           |
 |----------|----------|------------|----------------------------------|
-| TX       | GPIO 17  | TXD        | Default ESP32-S3 UART1          |
-| RX       | GPIO 16  | RXD        | Default ESP32-S3 UART1          |
+| TX       | GPIO 18  | TXD        | UART1 transmit                  |
+| RX       | GPIO 16  | RXD        | UART1 receive                   |
 | GND      | GND      | GND        | Common ground                   |
 | Power    | 5V       | VCC        | HW-519 needs 5V power           |
 
@@ -44,7 +44,7 @@ The HW-519 module has **automatic flow control** and only requires TX and RX con
 ```
 ESP32-S3          HW-519          RS485 Bus
 --------          ------          ---------
-GPIO17 ---------> TXD
+GPIO18 ---------> TXD
 GPIO16 <--------- RXD
 5V     ---------> VCC
 GND    ---------- GND ----------- GND
@@ -206,9 +206,8 @@ I (XXX) MB_SLAVE: ========================================
 I (XXX) MB_SLAVE: Slave Address: 1
 I (XXX) MB_SLAVE: Baudrate: 9600
 I (XXX) MB_SLAVE: UART Port: 1
-I (XXX) MB_SLAVE: TX Pin: GPIO17 (HW-519 TXD)
+I (XXX) MB_SLAVE: TX Pin: GPIO18 (HW-519 TXD)
 I (XXX) MB_SLAVE: RX Pin: GPIO16 (HW-519 RXD)
-I (XXX) MB_SLAVE: HW-519: Automatic flow control (no RTS needed)
 I (XXX) MB_SLAVE: ========================================
 I (XXX) MB_SLAVE: Starting WiFi AP for configuration...
 I (XXX) MB_SLAVE: WiFi AP started. SSID:ESP32-Modbus-Config Password:modbus123 Channel:1
@@ -235,7 +234,7 @@ I (XXX) MB_SLAVE: WiFi AP stopped - device now running in Modbus-only mode
 ### No Communication
 
 1. **Check wiring:** 
-   - TX (GPIO17) → HW-519 TXD
+   - TX (GPIO18) → HW-519 TXD
    - RX (GPIO16) → HW-519 RXD
    - 5V → HW-519 VCC (not 3.3V!)
    - GND → HW-519 GND
@@ -278,7 +277,7 @@ Edit in `main/main.c`:
 
 Edit in `main/main.c`:
 ```c
-#define MB_UART_TXD     (17)    // TX pin - HW-519 TXD
+#define MB_UART_TXD     (18)    // TX pin - HW-519 TXD
 #define MB_UART_RXD     (16)    // RX pin - HW-519 RXD
 // RTS not used with HW-519 (automatic flow control)
 ```
@@ -391,4 +390,4 @@ This project is based on the ESP-IDF Modbus example from Espressif Systems.
 - [ESP-IDF Modbus Documentation](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/protocols/modbus.html)
 - [Espressif esp-modbus GitHub](https://github.com/espressif/esp-modbus)
 - [Modbus Protocol Specification](https://modbus.org/specs.php)
-- [MAX485 Datasheet](https://www.analog.com/media/en/technical-documentation/data-sheets/MAX485-MAX491.pdf)
+- [HW-519 RS485 Module Information](https://www.google.com/search?q=HW-519+RS485+module)
