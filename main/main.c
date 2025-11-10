@@ -1,14 +1,21 @@
 /*
- * ESP32-S3 Modbus RTU Slave Example with MAX485
- * 
- * This example implements a Modbus RTU slave with two holding registers:
+ * ESP32-S3 Modbus RTU Slave Example with HW-519
+ *
+ * This example implements a Modbus RTU slave with 12 holding registers:
  * - Register 0: Sequential counter (increments on each access)
- * - Register 1: Random number (updated periodically)
- * - Register 2: Second counter (auto-reset)
- * - Registers 3-9: General purpose holding registers
- * 
+ * - Register 1: Random number (updated every 5 seconds)
+ * - Register 2: System uptime in seconds (low 16-bit)
+ * - Register 3-4: Free heap memory in KB (32-bit value)
+ * - Register 5: Minimum free heap since boot (KB)
+ * - Register 6: CPU frequency (MHz)
+ * - Register 7: Number of active FreeRTOS tasks
+ * - Register 8: Chip temperature × 10 (e.g., 235 = 23.5°C)
+ * - Register 9: Number of CPU cores
+ * - Register 10: WiFi AP enabled (1=active, 0=disabled)
+ * - Register 11: Number of connected WiFi clients
+ *
  * Features:
- * - WiFi AP active for 2 minutes after boot for configuration
+ * - WiFi AP active for 20 minutes after boot for configuration
  * - Web interface to configure slave ID and view statistics
  */
 
@@ -29,6 +36,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
+#include "esp_heap_caps.h"
+#include "esp_chip_info.h"
+#include "driver/temperature_sensor.h"
+#include "esp_private/esp_clk.h"
 
 #define MB_PORT_NUM     (1)         // UART port number for Modbus
 #define MB_SLAVE_ADDR   (1)         // Modbus slave address
@@ -46,7 +57,7 @@
 
 // Modbus register definitions
 #define MB_REG_HOLDING_START    (0)
-#define MB_REG_HOLDING_SIZE     (10)  // 10 holding registers
+#define MB_REG_HOLDING_SIZE     (12)  // 12 holding registers
 
 #define MB_PAR_INFO_GET_TOUT    (10) // Timeout for get parameter info
 
@@ -72,38 +83,88 @@ static uint8_t configured_slave_addr = MB_SLAVE_ADDR;
 static httpd_handle_t server = NULL;
 static bool ap_active = false;
 static TimerHandle_t ap_timer = NULL;
+static uint8_t wifi_connected_clients = 0;
+static volatile bool ap_shutdown_requested = false;
 
 // Holding registers storage
 #pragma pack(push, 1)
 typedef struct {
     uint16_t sequential_counter;  // Register 0: Sequential counter
     uint16_t random_number;       // Register 1: Random number
-    uint16_t holding_reg[8];      // Registers 2-9: General purpose holding registers
+    uint16_t uptime_seconds;      // Register 2: Uptime in seconds (low word)
+    uint16_t free_heap_kb_low;    // Register 3: Free heap in KB (low word)
+    uint16_t free_heap_kb_high;   // Register 4: Free heap in KB (high word)
+    uint16_t min_heap_kb;         // Register 5: Minimum free heap since boot in KB
+    uint16_t cpu_freq_mhz;        // Register 6: CPU frequency in MHz
+    uint16_t task_count;          // Register 7: Number of FreeRTOS tasks
+    uint16_t temperature_x10;     // Register 8: Chip temperature × 10 (e.g., 235 = 23.5°C)
+    uint16_t chip_cores;          // Register 9: Number of CPU cores
+    uint16_t wifi_enabled;        // Register 10: WiFi AP enabled (1 = active, 0 = disabled)
+    uint16_t wifi_clients;        // Register 11: Number of connected WiFi clients
 } holding_reg_params_t;
 #pragma pack(pop)
 
 holding_reg_params_t holding_reg_params = { 0 };
 
+// Temperature sensor handle
+static temperature_sensor_handle_t temp_sensor = NULL;
+
 // Initialize register data
 static void setup_reg_data(void)
 {
+    esp_chip_info_t chip_info;
+    esp_chip_info(&chip_info);
+
     holding_reg_params.sequential_counter = 0;
     holding_reg_params.random_number = (uint16_t)(esp_random() % 65536);
-    
-    // Initialize additional holding registers with test values
-    for (int i = 0; i < 8; i++) {
-        holding_reg_params.holding_reg[i] = 100 + i;
+    holding_reg_params.uptime_seconds = 0;
+
+    // Initialize chip-specific values
+    holding_reg_params.cpu_freq_mhz = (uint16_t)(esp_clk_cpu_freq() / 1000000);
+    holding_reg_params.chip_cores = (uint16_t)chip_info.cores;
+
+    // Initialize heap info
+    uint32_t free_heap = esp_get_free_heap_size();
+    uint32_t free_heap_kb = free_heap / 1024;
+    holding_reg_params.free_heap_kb_low = (uint16_t)(free_heap_kb & 0xFFFF);
+    holding_reg_params.free_heap_kb_high = (uint16_t)((free_heap_kb >> 16) & 0xFFFF);
+
+    uint32_t min_heap = esp_get_minimum_free_heap_size();
+    holding_reg_params.min_heap_kb = (uint16_t)(min_heap / 1024);
+
+    holding_reg_params.task_count = (uint16_t)uxTaskGetNumberOfTasks();
+
+    // Initialize WiFi status
+    holding_reg_params.wifi_enabled = 0;
+    holding_reg_params.wifi_clients = 0;
+
+    // Initialize temperature sensor
+    temperature_sensor_config_t temp_sensor_config = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
+    esp_err_t err = temperature_sensor_install(&temp_sensor_config, &temp_sensor);
+    if (err == ESP_OK) {
+        temperature_sensor_enable(temp_sensor);
+        float tsens_value = 0;
+        if (temperature_sensor_get_celsius(temp_sensor, &tsens_value) == ESP_OK) {
+            holding_reg_params.temperature_x10 = (uint16_t)(tsens_value * 10);
+        }
+        ESP_LOGI(TAG, "Temperature sensor initialized");
+    } else {
+        ESP_LOGW(TAG, "Temperature sensor initialization failed: %s", esp_err_to_name(err));
+        holding_reg_params.temperature_x10 = 0;
     }
-    
+
     ESP_LOGI(TAG, "Holding registers initialized:");
     ESP_LOGI(TAG, "  Register 0 (Sequential Counter): %u", holding_reg_params.sequential_counter);
     ESP_LOGI(TAG, "  Register 1 (Random Number): %u", holding_reg_params.random_number);
-    ESP_LOGI(TAG, "  Register 2 (Second Counter): %u", holding_reg_params.holding_reg[0]);
-    ESP_LOGI(TAG, "  Registers 3-9: %u, %u, %u, %u, %u, %u, %u",
-             holding_reg_params.holding_reg[1], holding_reg_params.holding_reg[2],
-             holding_reg_params.holding_reg[3], holding_reg_params.holding_reg[4],
-             holding_reg_params.holding_reg[5], holding_reg_params.holding_reg[6],
-             holding_reg_params.holding_reg[7]);
+    ESP_LOGI(TAG, "  Register 2 (Uptime): %u seconds", holding_reg_params.uptime_seconds);
+    ESP_LOGI(TAG, "  Register 3-4 (Free Heap): %lu KB", (uint32_t)holding_reg_params.free_heap_kb_low | ((uint32_t)holding_reg_params.free_heap_kb_high << 16));
+    ESP_LOGI(TAG, "  Register 5 (Min Heap): %u KB", holding_reg_params.min_heap_kb);
+    ESP_LOGI(TAG, "  Register 6 (CPU Freq): %u MHz", holding_reg_params.cpu_freq_mhz);
+    ESP_LOGI(TAG, "  Register 7 (Tasks): %u", holding_reg_params.task_count);
+    ESP_LOGI(TAG, "  Register 8 (Temperature): %.1f°C", holding_reg_params.temperature_x10 / 10.0);
+    ESP_LOGI(TAG, "  Register 9 (CPU Cores): %u", holding_reg_params.chip_cores);
+    ESP_LOGI(TAG, "  Register 10 (WiFi Enabled): %u", holding_reg_params.wifi_enabled);
+    ESP_LOGI(TAG, "  Register 11 (WiFi Clients): %u", holding_reg_params.wifi_clients);
 }
 
 // Load configuration from NVS
@@ -169,9 +230,15 @@ static esp_err_t root_handler(httpd_req_t *req)
     httpd_resp_sendstr_chunk(req, ".reg-table{width:100%;border-collapse:collapse;margin:10px 0}");
     httpd_resp_sendstr_chunk(req, ".reg-table th,.reg-table td{padding:8px;border:1px solid #ddd;text-align:left}");
     httpd_resp_sendstr_chunk(req, ".reg-table th{background:#4CAF50;color:white}");
+    httpd_resp_sendstr_chunk(req, ".auto-update{margin:15px 0;padding:10px;background:#f9f9f9;border-radius:4px}");
+    httpd_resp_sendstr_chunk(req, ".auto-update label{display:flex;align-items:center;cursor:pointer}");
+    httpd_resp_sendstr_chunk(req, ".auto-update input[type=checkbox]{margin-right:10px;width:auto;cursor:pointer}");
     httpd_resp_sendstr_chunk(req, "</style></head><body><div class='container'>");
     httpd_resp_sendstr_chunk(req, "<h1>ESP32 Modbus RTU Slave</h1>");
-    httpd_resp_sendstr_chunk(req, "<div class='info'>WiFi AP will turn off in 2 minutes after boot</div>");
+    httpd_resp_sendstr_chunk(req, "<div class='info'>WiFi AP will turn off in 20 minutes after boot</div>");
+    httpd_resp_sendstr_chunk(req, "<div class='auto-update'>");
+    httpd_resp_sendstr_chunk(req, "<label><input type='checkbox' id='autoUpdate' checked> Auto-update every 2 seconds</label>");
+    httpd_resp_sendstr_chunk(req, "</div>");
     httpd_resp_sendstr_chunk(req, "<div class='tabs'>");
     httpd_resp_sendstr_chunk(req, "<button class='tab active' onclick='showTab(0)'>Statistics</button>");
     httpd_resp_sendstr_chunk(req, "<button class='tab' onclick='showTab(1)'>Registers</button>");
@@ -187,19 +254,21 @@ static esp_err_t root_handler(httpd_req_t *req)
     httpd_resp_sendstr_chunk(req, "<div class='stat'><span class='label'>Current Slave ID:</span><span class='value' id='current_id'>-</span></div>");
     httpd_resp_sendstr_chunk(req, "</div>");
     httpd_resp_sendstr_chunk(req, "<div class='tab-content' id='tab1'>");
-    httpd_resp_sendstr_chunk(req, "<h2>Holding Registers (0-9)</h2>");
+    httpd_resp_sendstr_chunk(req, "<h2>Holding Registers (0-11)</h2>");
     httpd_resp_sendstr_chunk(req, "<table class='reg-table'>");
     httpd_resp_sendstr_chunk(req, "<tr><th>Address</th><th>Value (Decimal)</th><th>Value (Hex)</th><th>Description</th></tr>");
     httpd_resp_sendstr_chunk(req, "<tr><td>0</td><td id='reg0'>-</td><td id='reg0h'>-</td><td>Sequential Counter</td></tr>");
     httpd_resp_sendstr_chunk(req, "<tr><td>1</td><td id='reg1'>-</td><td id='reg1h'>-</td><td>Random Number</td></tr>");
-    httpd_resp_sendstr_chunk(req, "<tr><td>2</td><td id='reg2'>-</td><td id='reg2h'>-</td><td>Second Counter (auto-reset)</td></tr>");
-    httpd_resp_sendstr_chunk(req, "<tr><td>3</td><td id='reg3'>-</td><td id='reg3h'>-</td><td>General Purpose</td></tr>");
-    httpd_resp_sendstr_chunk(req, "<tr><td>4</td><td id='reg4'>-</td><td id='reg4h'>-</td><td>General Purpose</td></tr>");
-    httpd_resp_sendstr_chunk(req, "<tr><td>5</td><td id='reg5'>-</td><td id='reg5h'>-</td><td>General Purpose</td></tr>");
-    httpd_resp_sendstr_chunk(req, "<tr><td>6</td><td id='reg6'>-</td><td id='reg6h'>-</td><td>General Purpose</td></tr>");
-    httpd_resp_sendstr_chunk(req, "<tr><td>7</td><td id='reg7'>-</td><td id='reg7h'>-</td><td>General Purpose</td></tr>");
-    httpd_resp_sendstr_chunk(req, "<tr><td>8</td><td id='reg8'>-</td><td id='reg8h'>-</td><td>General Purpose</td></tr>");
-    httpd_resp_sendstr_chunk(req, "<tr><td>9</td><td id='reg9'>-</td><td id='reg9h'>-</td><td>General Purpose</td></tr>");
+    httpd_resp_sendstr_chunk(req, "<tr><td>2</td><td id='reg2'>-</td><td id='reg2h'>-</td><td>Uptime (seconds, low 16-bit)</td></tr>");
+    httpd_resp_sendstr_chunk(req, "<tr><td>3</td><td id='reg3'>-</td><td id='reg3h'>-</td><td>Free Heap KB (low word)</td></tr>");
+    httpd_resp_sendstr_chunk(req, "<tr><td>4</td><td id='reg4'>-</td><td id='reg4h'>-</td><td>Free Heap KB (high word)</td></tr>");
+    httpd_resp_sendstr_chunk(req, "<tr><td>5</td><td id='reg5'>-</td><td id='reg5h'>-</td><td>Minimum Free Heap KB</td></tr>");
+    httpd_resp_sendstr_chunk(req, "<tr><td>6</td><td id='reg6'>-</td><td id='reg6h'>-</td><td>CPU Frequency (MHz)</td></tr>");
+    httpd_resp_sendstr_chunk(req, "<tr><td>7</td><td id='reg7'>-</td><td id='reg7h'>-</td><td>Task Count</td></tr>");
+    httpd_resp_sendstr_chunk(req, "<tr><td>8</td><td id='reg8'>-</td><td id='reg8h'>-</td><td>Temperature (×10, e.g. 235=23.5°C)</td></tr>");
+    httpd_resp_sendstr_chunk(req, "<tr><td>9</td><td id='reg9'>-</td><td id='reg9h'>-</td><td>CPU Cores</td></tr>");
+    httpd_resp_sendstr_chunk(req, "<tr><td>10</td><td id='reg10'>-</td><td id='reg10h'>-</td><td>WiFi AP Enabled (1=active, 0=disabled)</td></tr>");
+    httpd_resp_sendstr_chunk(req, "<tr><td>11</td><td id='reg11'>-</td><td id='reg11h'>-</td><td>WiFi Connected Clients</td></tr>");
     httpd_resp_sendstr_chunk(req, "</table></div>");
     httpd_resp_sendstr_chunk(req, "<div class='tab-content' id='tab2'>");
     httpd_resp_sendstr_chunk(req, "<h2>Configuration</h2><form id='configForm'>");
@@ -228,7 +297,7 @@ static esp_err_t root_handler(httpd_req_t *req)
     httpd_resp_sendstr_chunk(req, "document.getElementById('reg'+i+'h').textContent='0x'+v.toString(16).toUpperCase().padStart(4,'0');");
     httpd_resp_sendstr_chunk(req, "});});}");
     httpd_resp_sendstr_chunk(req, "updateStats();updateRegisters();");
-    httpd_resp_sendstr_chunk(req, "setInterval(()=>{updateStats();updateRegisters();},2000);");
+    httpd_resp_sendstr_chunk(req, "let updateInterval=setInterval(()=>{if(document.getElementById('autoUpdate').checked){updateStats();updateRegisters();}},2000);");
     httpd_resp_sendstr_chunk(req, "document.getElementById('configForm').addEventListener('submit',function(e){");
     httpd_resp_sendstr_chunk(req, "e.preventDefault();");
     httpd_resp_sendstr_chunk(req, "const id=document.getElementById('slave_id').value;");
@@ -265,18 +334,20 @@ static esp_err_t registers_handler(httpd_req_t *req)
 {
     char json[512];
     snprintf(json, sizeof(json),
-        "{\"registers\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u]}",
+        "{\"registers\":[%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u]}",
         holding_reg_params.sequential_counter,
         holding_reg_params.random_number,
-        holding_reg_params.holding_reg[0],
-        holding_reg_params.holding_reg[1],
-        holding_reg_params.holding_reg[2],
-        holding_reg_params.holding_reg[3],
-        holding_reg_params.holding_reg[4],
-        holding_reg_params.holding_reg[5],
-        holding_reg_params.holding_reg[6],
-        holding_reg_params.holding_reg[7]);
-    
+        holding_reg_params.uptime_seconds,
+        holding_reg_params.free_heap_kb_low,
+        holding_reg_params.free_heap_kb_high,
+        holding_reg_params.min_heap_kb,
+        holding_reg_params.cpu_freq_mhz,
+        holding_reg_params.task_count,
+        holding_reg_params.temperature_x10,
+        holding_reg_params.chip_cores,
+        holding_reg_params.wifi_enabled,
+        holding_reg_params.wifi_clients);
+
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -381,30 +452,26 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 {
     if (event_id == WIFI_EVENT_AP_STACONNECTED) {
         wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
-        ESP_LOGI(TAG, "Station " MACSTR " joined, AID=%d",
-                 MAC2STR(event->mac), event->aid);
+        wifi_connected_clients++;
+        holding_reg_params.wifi_clients = wifi_connected_clients;
+        ESP_LOGI(TAG, "Station " MACSTR " joined, AID=%d (Total clients: %u)",
+                 MAC2STR(event->mac), event->aid, wifi_connected_clients);
     } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
         wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
-        ESP_LOGI(TAG, "Station " MACSTR " left, AID=%d",
-                 MAC2STR(event->mac), event->aid);
+        if (wifi_connected_clients > 0) {
+            wifi_connected_clients--;
+        }
+        holding_reg_params.wifi_clients = wifi_connected_clients;
+        ESP_LOGI(TAG, "Station " MACSTR " left, AID=%d (Total clients: %u)",
+                 MAC2STR(event->mac), event->aid, wifi_connected_clients);
     }
 }
 
-// Timer callback to stop AP
+// Timer callback to stop AP - just sets flag, actual shutdown done in main loop
+// NOTE: Must be minimal - timer service task has small stack
 static void ap_timer_callback(TimerHandle_t xTimer)
 {
-    ESP_LOGI(TAG, "AP timeout reached - shutting down WiFi AP");
-    
-    if (server) {
-        stop_webserver(server);
-        server = NULL;
-    }
-    
-    esp_wifi_stop();
-    esp_wifi_deinit();
-    ap_active = false;
-    
-    ESP_LOGI(TAG, "WiFi AP stopped - device now running in Modbus-only mode");
+    ap_shutdown_requested = true;
 }
 
 // Initialize and start WiFi AP
@@ -445,11 +512,15 @@ static void wifi_init_softap(void)
              WIFI_AP_SSID, WIFI_AP_PASSWORD, WIFI_AP_CHANNEL);
     ESP_LOGI(TAG, "Connect to http://192.168.4.1 to configure");
     ESP_LOGI(TAG, "AP will automatically turn off in %d minutes", AP_TIMEOUT_MINUTES);
-    
+
     // Start web server
     server = start_webserver();
     ap_active = true;
-    
+
+    // Update WiFi status registers
+    holding_reg_params.wifi_enabled = 1;
+    holding_reg_params.wifi_clients = 0;
+
     // Create and start timer
     ap_timer = xTimerCreate("ap_timer", pdMS_TO_TICKS(AP_TIMEOUT_MS), pdFALSE, NULL, ap_timer_callback);
     if (ap_timer != NULL) {
@@ -479,19 +550,37 @@ static void uptime_task(void *arg)
     }
 }
 
-// Task to update second counter in register 2
-static void second_counter_task(void *arg)
+// Task to update ESP32 metrics
+static void metrics_update_task(void *arg)
 {
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000)); // Update every second
-        
-        // Increment counter, reset to 0 when it reaches max value
-        if (holding_reg_params.holding_reg[0] >= 65535) {
-            holding_reg_params.holding_reg[0] = 0;
-            ESP_LOGI(TAG, "Second counter reset to 0");
-        } else {
-            holding_reg_params.holding_reg[0]++;
+        vTaskDelay(pdMS_TO_TICKS(2000)); // Update every 2 seconds
+
+        // Update uptime (from modbus_stats)
+        holding_reg_params.uptime_seconds = (uint16_t)(modbus_stats.uptime_seconds & 0xFFFF);
+
+        // Update heap information
+        uint32_t free_heap = esp_get_free_heap_size();
+        uint32_t free_heap_kb = free_heap / 1024;
+        holding_reg_params.free_heap_kb_low = (uint16_t)(free_heap_kb & 0xFFFF);
+        holding_reg_params.free_heap_kb_high = (uint16_t)((free_heap_kb >> 16) & 0xFFFF);
+
+        uint32_t min_heap = esp_get_minimum_free_heap_size();
+        holding_reg_params.min_heap_kb = (uint16_t)(min_heap / 1024);
+
+        // Update task count
+        holding_reg_params.task_count = (uint16_t)uxTaskGetNumberOfTasks();
+
+        // Update temperature
+        if (temp_sensor != NULL) {
+            float tsens_value = 0;
+            if (temperature_sensor_get_celsius(temp_sensor, &tsens_value) == ESP_OK) {
+                holding_reg_params.temperature_x10 = (uint16_t)(tsens_value * 10);
+            }
         }
+
+        // CPU frequency shouldn't change, but update just in case
+        holding_reg_params.cpu_freq_mhz = (uint16_t)(esp_clk_cpu_freq() / 1000000);
     }
 }
 
@@ -523,25 +612,21 @@ void app_main(void)
     ESP_LOGI(TAG, "TX Pin: GPIO%d (HW-519 TXD)", MB_UART_TXD);
     ESP_LOGI(TAG, "RX Pin: GPIO%d (HW-519 RXD)", MB_UART_RXD);
     ESP_LOGI(TAG, "========================================");
-    
-    // Start WiFi AP for configuration
-    ESP_LOGI(TAG, "Starting WiFi AP for configuration...");
-    wifi_init_softap();
-    
+
     // Initialize Modbus controller
     void *mbc_slave_handler = NULL;
-    
+
     ESP_ERROR_CHECK(mbc_slave_init(MB_PORT_SERIAL_SLAVE, &mbc_slave_handler));
-    
+
     mb_communication_info_t comm_info = { 0 };
     comm_info.port = MB_PORT_NUM;
     comm_info.mode = MB_MODE_RTU;
     comm_info.baudrate = MB_DEV_SPEED;
     comm_info.parity = MB_PARITY_NONE;
     comm_info.slave_addr = configured_slave_addr;  // Use configured slave address
-    
+
     ESP_ERROR_CHECK(mbc_slave_setup(&comm_info));
-    
+
     // The code below initializes Modbus register area descriptors
     // for Modbus Holding Registers
     reg_area.type = MB_PARAM_HOLDING;
@@ -549,9 +634,13 @@ void app_main(void)
     reg_area.address = (void*)&holding_reg_params;
     reg_area.size = sizeof(holding_reg_params);
     ESP_ERROR_CHECK(mbc_slave_set_descriptor(reg_area));
-    
+
     // Initialize register values
     setup_reg_data();
+
+    // Start WiFi AP for configuration (after register initialization)
+    ESP_LOGI(TAG, "Starting WiFi AP for configuration...");
+    wifi_init_softap();
     
     // Start Modbus stack (this initializes UART)
     ESP_ERROR_CHECK(mbc_slave_start());
@@ -584,17 +673,25 @@ void app_main(void)
     ESP_LOGI(TAG, "Modbus registers:");
     ESP_LOGI(TAG, "  Address 0: Sequential Counter (Read/Write)");
     ESP_LOGI(TAG, "  Address 1: Random Number (Read Only)");
-    ESP_LOGI(TAG, "  Address 2: Second Counter (Read Only)");
+    ESP_LOGI(TAG, "  Address 2: Uptime Seconds (Read Only)");
+    ESP_LOGI(TAG, "  Address 3-4: Free Heap KB (Read Only, 32-bit)");
+    ESP_LOGI(TAG, "  Address 5: Min Free Heap KB (Read Only)");
+    ESP_LOGI(TAG, "  Address 6: CPU Frequency MHz (Read Only)");
+    ESP_LOGI(TAG, "  Address 7: Task Count (Read Only)");
+    ESP_LOGI(TAG, "  Address 8: Temperature x10 (Read Only)");
+    ESP_LOGI(TAG, "  Address 9: CPU Cores (Read Only)");
+    ESP_LOGI(TAG, "  Address 10: WiFi AP Enabled (Read Only)");
+    ESP_LOGI(TAG, "  Address 11: WiFi Connected Clients (Read Only)");
     ESP_LOGI(TAG, "Waiting for Modbus master requests...");
     
     // Create task to update random number
     xTaskCreate(update_random_task, "update_random", 2048, NULL, 5, NULL);
-    
+
     // Create task to update uptime
     xTaskCreate(uptime_task, "uptime", 2048, NULL, 5, NULL);
-    
-    // Create task to update second counter in register 2
-    xTaskCreate(second_counter_task, "second_counter", 2048, NULL, 5, NULL);
+
+    // Create task to update ESP32 metrics
+    xTaskCreate(metrics_update_task, "metrics_update", 4096, NULL, 5, NULL);
     
     // Check UART buffer to see if data is arriving
     size_t uart_buf_len;
@@ -635,7 +732,31 @@ void app_main(void)
         }
         
         poll_count++;
-        
+
+        // Check if WiFi AP shutdown was requested by timer
+        if (ap_shutdown_requested && ap_active) {
+            ESP_LOGI(TAG, "Processing WiFi AP shutdown...");
+
+            if (server) {
+                stop_webserver(server);
+                server = NULL;
+            }
+
+            esp_wifi_stop();
+            esp_wifi_deinit();
+            ap_active = false;
+            wifi_connected_clients = 0;
+            ap_shutdown_requested = false;
+
+            // Update WiFi status registers
+            holding_reg_params.wifi_enabled = 0;
+            holding_reg_params.wifi_clients = 0;
+
+            ESP_LOGI(TAG, "WiFi AP stopped - device now running in Modbus-only mode");
+            ESP_LOGI(TAG, "Register 10 (WiFi Enabled) set to: %u", holding_reg_params.wifi_enabled);
+            ESP_LOGI(TAG, "Register 11 (WiFi Clients) set to: %u", holding_reg_params.wifi_clients);
+        }
+
         // Check for Modbus events
         mb_event_group_t event = mbc_slave_check_event(MB_READ_WRITE_MASK);
         

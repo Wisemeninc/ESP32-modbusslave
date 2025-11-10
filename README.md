@@ -5,14 +5,20 @@ This project implements a Modbus RTU slave on an ESP32-S3 using the HW-519 RS485
 ## Features
 
 - **Modbus RTU Slave** with configurable address (1-247)
-- **Ten Holding Registers (0-9):**
+- **Twelve Holding Registers (0-11):**
   - Register 0: Sequential counter (increments on each access)
   - Register 1: Random number (updated every 5 seconds)
-  - Register 2: Second counter (increments every second, auto-resets at 65535)
-  - Registers 3-9: General purpose holding registers
+  - Register 2: System uptime in seconds (low 16-bit)
+  - Register 3-4: Free heap memory in KB (32-bit value)
+  - Register 5: Minimum free heap since boot (KB)
+  - Register 6: CPU frequency (MHz)
+  - Register 7: Number of active FreeRTOS tasks
+  - Register 8: Chip temperature × 10 (e.g., 235 = 23.5°C)
+  - Register 9: Number of CPU cores
+  - Register 10: WiFi AP enabled (1=active, 0=disabled)
+  - Register 11: Number of connected WiFi clients
 - **HW-519 RS485 module** with automatic flow control
-- **Half-duplex RS485** communication
-- **WiFi Access Point** for configuration (active for 2 minutes after boot)
+- **WiFi Access Point** for configuration (active for 20 minutes after boot)
   - SSID: `ESP32-Modbus-Config`
   - Password: `modbus123`
   - Configure Modbus slave ID via web interface (no restart required)
@@ -101,12 +107,28 @@ The web interface is organized into three tabs:
 
 ## Modbus Register Map
 
-| Register Address | Type           | Description                          | Access      |
-|------------------|----------------|--------------------------------------|-------------|
-| 0                | Holding (16bit)| Sequential counter                   | Read/Write  |
-| 1                | Holding (16bit)| Random number (0-65535)             | Read/Write  |
-| 2                | Holding (16bit)| Second counter (auto-reset)         | Read/Write  |
-| 3-9              | Holding (16bit)| General purpose registers            | Read/Write  |
+| Register Address | Type           | Description                                      | Access      | Update Rate |
+|------------------|----------------|--------------------------------------------------|-------------|-------------|
+| 0                | Holding (16bit)| Sequential counter (increments on each access)   | Read/Write  | On access   |
+| 1                | Holding (16bit)| Random number (0-65535)                         | Read Only   | Every 5s    |
+| 2                | Holding (16bit)| Uptime in seconds (low 16-bit, wraps at 65535)  | Read Only   | Every 2s    |
+| 3                | Holding (16bit)| Free heap memory in KB (low word)               | Read Only   | Every 2s    |
+| 4                | Holding (16bit)| Free heap memory in KB (high word)              | Read Only   | Every 2s    |
+| 5                | Holding (16bit)| Minimum free heap since boot (KB)               | Read Only   | Every 2s    |
+| 6                | Holding (16bit)| CPU frequency in MHz                            | Read Only   | Every 2s    |
+| 7                | Holding (16bit)| Number of FreeRTOS tasks                        | Read Only   | Every 2s    |
+| 8                | Holding (16bit)| Chip temperature × 10 (e.g., 235 = 23.5°C)     | Read Only   | Every 2s    |
+| 9                | Holding (16bit)| Number of CPU cores                             | Read Only   | Static      |
+| 10               | Holding (16bit)| WiFi AP enabled (1=active, 0=disabled)          | Read Only   | On change   |
+| 11               | Holding (16bit)| Number of connected WiFi clients (0-4)          | Read Only   | On change   |
+
+**Notes:**
+- Registers 3-4 form a 32-bit value for total free heap. To get the actual value in KB:
+  ```
+  free_heap_kb = (register_4 << 16) | register_3
+  ```
+- Register 10 shows WiFi AP status: 1 when active (first 20 minutes after boot), 0 after timeout
+- Register 11 shows real-time count of connected WiFi clients (updates immediately on connect/disconnect)
 
 ## Building and Flashing
 
@@ -143,14 +165,27 @@ platformio run --target upload --target monitor
 
 You can test this slave using various Modbus master tools:
 
-### Using ModbusCLI (Command Line)
+### Using mbpoll (Command Line)
 
 ```bash
-# Read holding registers
-modbus read -s 1 -a 0 -n 2 /dev/ttyUSB0 9600
+# Read all 12 holding registers starting at address 0
+mbpoll -a 1 -0 -r 0 -c 12 -t 4 -b 9600 -P none -s 1 /dev/ttyUSB0
 
-# Write to sequential counter
-modbus write -s 1 -a 0 -v 100 /dev/ttyUSB0 9600
+# Breakdown of flags:
+# -a 1       : Slave address 1
+# -0         : Use zero-based register addressing (PDU addressing)
+# -r 0       : Start at register 0
+# -c 12      : Read 12 registers
+# -t 4       : Type 4 = holding registers (16-bit)
+# -b 9600    : Baud rate
+# -P none    : No parity
+# -s 1       : 1 stop bit
+
+# Write a value to register 0 (sequential counter)
+mbpoll -a 1 -0 -r 0 -t 4 -b 9600 -P none -s 1 /dev/ttyUSB0 500
+
+# Read WiFi status registers (10 and 11)
+mbpoll -a 1 -0 -r 10 -c 2 -t 4 -b 9600 -P none -s 1 /dev/ttyUSB0
 ```
 
 ### Using QModMaster (GUI)
@@ -167,7 +202,7 @@ modbus write -s 1 -a 0 -v 100 /dev/ttyUSB0 9600
    - Function: Read Holding Registers (0x03)
    - Slave ID: 1
    - Start Address: 0
-   - Number of registers: 2
+   - Number of registers: 12
 
 ### Using Python pymodbus
 
@@ -186,10 +221,16 @@ client = ModbusSerialClient(
 
 client.connect()
 
-# Read holding registers
-result = client.read_holding_registers(address=0, count=2, unit=1)
+# Read all 12 holding registers
+result = client.read_holding_registers(address=0, count=12, unit=1)
 print(f"Sequential Counter: {result.registers[0]}")
 print(f"Random Number: {result.registers[1]}")
+print(f"Uptime (seconds): {result.registers[2]}")
+print(f"Free Heap (KB): {(result.registers[4] << 16) | result.registers[3]}")
+print(f"CPU Frequency (MHz): {result.registers[6]}")
+print(f"Temperature (°C): {result.registers[8] / 10.0}")
+print(f"WiFi Enabled: {result.registers[10]}")
+print(f"WiFi Clients: {result.registers[11]}")
 
 # Write to sequential counter
 client.write_register(address=0, value=500, unit=1)

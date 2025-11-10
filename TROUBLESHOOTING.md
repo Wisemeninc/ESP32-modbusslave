@@ -115,7 +115,7 @@ sudo usermod -a -G dialout $USER
 # Then logout/login
 
 # Or temporarily use sudo
-sudo mbpoll -a 1 -r 0 -c 10 -t 4 -b 9600 -P none /dev/ttyUSB0
+sudo mbpoll -a 1 -0 -r 0 -c 10 -t 4 -b 9600 -P none -s 1 /dev/ttyUSB0
 ```
 
 ### 8. Try Different Serial Ports
